@@ -173,7 +173,8 @@ def call_llm(user, err=None, model=None, timeout=12):
     payload = {"model": model, "temperature": 0, "messages": msgs, "response_format": {"type": "json_object"}}
     for _ in range(2):
         req = urllib.request.Request(base + "/chat/completions", json.dumps(payload).encode(),
-                                     {"Content-Type": "application/json", "Authorization": "Bearer " + key})
+                                     {"Content-Type": "application/json", "Authorization": "Bearer " + key,
+                                      "Accept": "application/json", "User-Agent": "incident-agent/1.0 (+https://render.com)"})
         try:
             r = json.load(urllib.request.urlopen(req, timeout=timeout))
         except urllib.error.HTTPError as e:
@@ -220,7 +221,7 @@ def make_plan(body):
             "policy": {k: body["policy"].get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}}
     t0, err, plan, name, last = time.time_ns(), None, None, os.environ.get("LLM_MODEL", "gpt-4o-mini"), None
     base = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
-    fb = os.environ.get("LLM_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite" if "generativelanguage" in base else "")
+    fb = os.environ.get("LLM_FALLBACK_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite" if "generativelanguage" in base else "")
     models = list(dict.fromkeys([name] + [m.strip() for m in fb.split(",") if m.strip()]))
     if not os.environ.get("LLM_API_KEY"):
         log("WARNING: LLM_API_KEY not set; using heuristic fallback")
@@ -239,11 +240,14 @@ def make_plan(body):
                     if isinstance(e, urllib.error.HTTPError):
                         try: err += " " + e.read().decode()[:200]
                         except Exception: pass
+                        if e.code in (429, 500, 502, 503, 504) and tries < 2:
+                            LLM_STATE["lastError"] = "[%s] %s" % (m, err)
+                            time.sleep(1.5)
+                            continue  # one quick retry on the same model
                         if e.code in (429, 500, 502, 503, 504, 404):
-                            err_model = err
                             LLM_STATE["lastError"] = "[%s] %s" % (m, err)
                             log("LLM error (next model):", m, err[:120])
-                            break  # transient/unknown model: move to next model
+                            break  # give up on this model, try the next
                     LLM_STATE["lastError"] = "[%s] %s" % (m, err)
                     log("LLM/plan error:", m, err[:160])
             if plan is not None:
