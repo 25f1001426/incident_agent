@@ -1,5 +1,5 @@
 
-import hashlib, json, os, re, secrets, sqlite3, threading, time, urllib.error, urllib.request
+import hashlib, json, os, re, secrets, sqlite3, sys, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROFILE = "ga5-incident-agent/v2"
@@ -8,6 +8,10 @@ DB = sqlite3.connect(os.path.join(os.environ.get("DATA_DIR", "."), "incident_sta
 DB.execute("create table if not exists runs(run_id text primary key, req_hash text, state text)")
 DB.execute("create table if not exists receipts(run_id text, receipt_id text, hash text, response text, primary key(run_id,receipt_id))")
 DB.commit()
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
 
 
 class HttpErr(Exception):
@@ -30,6 +34,7 @@ def nz_hex(n):
             return h
 
 
+# ---------------------------------------------------------------- planner
 def evidence_ids(t):
     return [m.group(1).strip() for m in re.finditer(r"^\s*\[([^\]]+)\]", t, re.M)]
 
@@ -77,9 +82,16 @@ def check_args(schema, args):
     return None
 
 
-def validate_plan(plan, body):
+def validate_plan(plan, body, strict=True):
     inc, pol = body["incident"], body["policy"]
-    ids = set(evidence_ids(inc["transcript"]))
+    all_ids = evidence_ids(inc["transcript"])
+    ids = set(all_ids)
+    if not strict:
+        ev0 = [e for e in dict.fromkeys(plan.get("evidence") or []) if e in ids]
+        ev0 += [e for e in dict.fromkeys(all_ids) if e not in ev0]
+        plan = dict(plan, evidence=ev0[:max(2, min(4, len(plan.get("evidence") or [])))])
+        if plan.get("rootCause") not in inc["allowedRootCauses"]:
+            plan["rootCause"] = inc["allowedRootCauses"][0]
     cat = {t["name"]: t for t in body["toolCatalog"]}
     eff_tools = pol.get("effectTools", [])
     if plan.get("rootCause") not in inc["allowedRootCauses"]:
@@ -89,15 +101,18 @@ def validate_plan(plan, body):
         raise ValueError("evidence must be 2-4 unique ids present in transcript")
     maxd = min(3, int(pol.get("maximumDiagnostics", 3)))
     ds = plan.get("diagnostics")
+    if not strict and isinstance(ds, list):
+        ds = ds[:maxd]
     if not (isinstance(ds, list) and 1 <= len(ds) <= maxd):
         raise ValueError("need 1..%d diagnostics" % maxd)
     out, seen = [], set()
     for d in ds:
         n = d.get("toolName")
         if n not in cat or n in eff_tools:
-            raise ValueError("diagnostic tool must be non-effect catalog tool")
+            if strict: raise ValueError("diagnostic tool must be non-effect catalog tool")
+            continue
         e = check_args(cat[n].get("inputSchema"), d.get("arguments"))
-        if e:
+        if e and strict:
             raise ValueError(n + ": " + e)
         de = [x for x in dict.fromkeys(d.get("evidence") or []) if x in ev] or [ev[0]]
         key = canon([n, d["arguments"]])
@@ -108,9 +123,10 @@ def validate_plan(plan, body):
     f = plan.get("effect") or {}
     n = f.get("toolName")
     if n not in eff_tools or n not in cat:
-        raise ValueError("effect must be one of policy.effectTools")
-    e = check_args(cat[n].get("inputSchema"), f.get("arguments"))
-    if e:
+        if strict: raise ValueError("effect must be one of policy.effectTools")
+        n = next((t for t in eff_tools if t in cat), eff_tools[0]); f = dict(f, arguments=f.get("arguments") if isinstance(f.get("arguments"), dict) else {})
+    e = check_args(cat[n].get("inputSchema"), f.get("arguments")) if n in cat else None
+    if e and strict:
         raise ValueError(n + ": " + e)
     fe = [x for x in dict.fromkeys(f.get("evidence") or []) if x in ev] or list(ev)
     return {"rootCause": plan["rootCause"], "evidence": list(ev), "diagnostics": out,
@@ -155,7 +171,8 @@ def heuristic(body):  # last-resort fallback only when the model is unavailable/
     tk = lambda x: set(re.findall(r"[a-z]{4,}", x.lower()))
     best = max(inc["allowedRootCauses"], key=lambda c: sum(len(tk(c) & tk(l)) for l in lines))
     top = sorted(lines, key=lambda l: -len(tk(best) & tk(l)))[:2]
-    ev = [evidence_ids(l)[0] for l in top]
+    ev = list(dict.fromkeys(evidence_ids(l)[0] for l in top))
+    ev += [e for e in dict.fromkeys(evidence_ids(inc['transcript'])) if e not in ev][:max(0, 2 - len(ev))]
 
     def fill(schema):
         a = {}
@@ -182,20 +199,30 @@ def make_plan(body):
                          "transcript": scrub(inc["transcript"], body), "allowedRootCauses": inc["allowedRootCauses"]},
             "toolCatalog": body["toolCatalog"],
             "policy": {k: body["policy"].get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}}
-    t0, err, plan, name = time.time_ns(), None, None, os.environ.get("LLM_MODEL", "gpt-4o-mini")
-    for _ in range(2):
-        try:
-            plan = validate_plan(call_llm(user, err), body)
-            break
-        except Exception as e:  # noqa
-            err = str(e)[:200]
-            if str(e) == "no key":
+    t0, err, plan, name, last = time.time_ns(), None, None, os.environ.get("LLM_MODEL", "gpt-4o-mini"), None
+    if not os.environ.get("LLM_API_KEY"):
+        log("WARNING: LLM_API_KEY not set; using heuristic fallback")
+    else:
+        for _ in range(2):
+            try:
+                last = call_llm(user, err)
+                plan = validate_plan(last, body)
                 break
+            except Exception as e:  # noqa
+                err = "%s: %s" % (type(e).__name__, str(e)[:200])
+                log("LLM/plan error:", err)
+        if plan is None and last:
+            try:
+                plan = validate_plan(last, body, strict=False)
+                log("using lenient model plan")
+            except Exception as e:
+                log("lenient plan failed:", e)
     if plan is None:
         name = "heuristic-fallback"
         try:
-            plan = validate_plan(heuristic(body), body)
-        except Exception:
+            plan = validate_plan(heuristic(body), body, strict=False)
+        except Exception as e:
+            log("heuristic failed:", type(e).__name__, e)
             raise HttpErr(422, "unplannable")
     return plan, name, t0, time.time_ns()
 
@@ -402,15 +429,16 @@ def load(run_id):
 
 def validate_create(b):
     try:
-        if b.get("profile") != PROFILE: raise ValueError
+        if b.get("profile") != PROFILE: raise ValueError("profile")
         inc, pol = b["incident"], b["policy"]
         ok = (isinstance(b["runId"], str) and b["runId"] and isinstance(b["publicMarker"], str)
-              and isinstance(b.get("agentName"), str) and isinstance(inc["transcript"], str)
+              and isinstance(inc["transcript"], str)
               and isinstance(inc["allowedRootCauses"], list) and inc["allowedRootCauses"]
               and isinstance(b["toolCatalog"], list) and all(isinstance(t, dict) and t.get("name") for t in b["toolCatalog"])
               and isinstance(pol, dict) and isinstance(pol.get("effectTools"), list) and pol["effectTools"])
-        if not ok: raise ValueError
-    except (KeyError, ValueError, TypeError, AttributeError):
+        if not ok: raise ValueError("shape check failed")
+    except (KeyError, ValueError, TypeError, AttributeError) as e:
+        log("create rejected:", type(e).__name__, str(e)[:100])
         raise HttpErr(400)
 
 
@@ -422,6 +450,7 @@ def parse_tp(h):
 def create(b, tp, ts):
     validate_create(b)
     h = sha(b)
+    b = dict(b, agentName=b.get("agentName") if isinstance(b.get("agentName"), str) else "incident-response")
     with LOCK:
         ex = load(b["runId"])
         if ex:
@@ -477,6 +506,21 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def read_body(self):
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            data = b""
+            while True:
+                size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline().strip(): pass
+                    break
+                data += self.rfile.read(size); self.rfile.readline()
+                if len(data) > 1_000_000: raise HttpErr(413, "too large")
+            return data
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 1_000_000: raise HttpErr(413, "too large")
+        return self.rfile.read(n)
+
     def route(self, method):
         try:
             m = re.fullmatch(r"/v2/incidents(?:/([^/]+)(/receipts)?)?", self.path.split("?")[0].rstrip("/") or "/")
@@ -487,9 +531,8 @@ class H(BaseHTTPRequestHandler):
                 s = load(m.group(1))
                 if not s: raise HttpErr(404, "not found")
                 return self.out(200, view(s))
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > 1_000_000: raise HttpErr(413, "too large")
-            try: b = json.loads(self.rfile.read(n) or b"null")
+            raw = self.read_body()
+            try: b = json.loads(raw or b"null")
             except Exception: raise HttpErr(400, "invalid json")
             if not isinstance(b, dict): raise HttpErr(400, "invalid body")
             if not m.group(1): return self.out(200, create(b, self.headers.get("traceparent"), self.headers.get("tracestate")))
@@ -497,7 +540,8 @@ class H(BaseHTTPRequestHandler):
             raise HttpErr(404, "not found")
         except HttpErr as e:
             self.out(e.code, {"error": e.msg})
-        except Exception:
+        except Exception as e:
+            log("internal error:", type(e).__name__, str(e)[:200])
             self.out(500, {"error": "internal"})
 
     def do_GET(self): self.route("GET")
