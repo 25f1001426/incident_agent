@@ -1,4 +1,3 @@
-
 import hashlib, json, os, re, secrets, sqlite3, sys, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -12,6 +11,23 @@ DB.commit()
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+RECENT = []
+LLM_STATE = {"lastError": None, "lastOk": None}
+
+
+def shape(o, depth=0):
+    if isinstance(o, dict):
+        return {k: ("<omitted>" if k in ("sensitive", "transcript") else shape(v, depth + 1)) for k, v in list(o.items())[:40]} if depth < 5 else "dict"
+    if isinstance(o, list):
+        return ["list[%d]" % len(o)] + ([shape(o[0], depth + 1)] if o and depth < 5 else [])
+    return type(o).__name__
+
+
+def record(path, code, reason, body):
+    RECENT.append({"t": time.strftime("%H:%M:%S"), "path": path, "status": code, "reason": reason, "shape": shape(body)})
+    del RECENT[:-20]
 
 
 class HttpErr(Exception):
@@ -36,7 +52,10 @@ def nz_hex(n):
 
 # ---------------------------------------------------------------- planner
 def evidence_ids(t):
-    return [m.group(1).strip() for m in re.finditer(r"^\s*\[([^\]]+)\]", t, re.M)]
+    if isinstance(t, list):
+        t = "\n".join(map(str, t))
+    ids = [m.group(1).strip() for m in re.finditer(r"^\W*\[([^\]]+)\]", t, re.M)]
+    return ids or [m.group(1) for m in re.finditer(r"\[(ev_[\w.-]+)\]", t)]
 
 
 def strings_in(o):
@@ -156,7 +175,7 @@ def call_llm(user, err=None):
         req = urllib.request.Request(base + "/chat/completions", json.dumps(payload).encode(),
                                      {"Content-Type": "application/json", "Authorization": "Bearer " + key})
         try:
-            r = json.load(urllib.request.urlopen(req, timeout=45))
+            r = json.load(urllib.request.urlopen(req, timeout=20))
         except urllib.error.HTTPError as e:
             if e.code == 400 and "response_format" in payload:
                 payload.pop("response_format")
@@ -206,11 +225,17 @@ def make_plan(body):
         for _ in range(2):
             try:
                 last = call_llm(user, err)
+                LLM_STATE["lastOk"] = time.strftime("%H:%M:%S")
                 plan = validate_plan(last, body)
                 break
             except Exception as e:  # noqa
                 err = "%s: %s" % (type(e).__name__, str(e)[:200])
+                if isinstance(e, urllib.error.HTTPError):
+                    try: err += " " + e.read().decode()[:200]
+                    except Exception: pass
+                LLM_STATE["lastError"] = err
                 log("LLM/plan error:", err)
+                if time.time_ns() - t0 > 14e9: break
         if plan is None and last:
             try:
                 plan = validate_plan(last, body, strict=False)
@@ -431,15 +456,18 @@ def validate_create(b):
     try:
         if b.get("profile") != PROFILE: raise ValueError("profile")
         inc, pol = b["incident"], b["policy"]
-        ok = (isinstance(b["runId"], str) and b["runId"] and isinstance(b["publicMarker"], str)
-              and isinstance(inc["transcript"], str)
+        if isinstance(inc.get("transcript"), list):
+            inc["transcript"] = "\n".join(map(str, inc["transcript"]))
+        pol.setdefault("effectTools", [])
+        ok = (isinstance(b["runId"], str) and b["runId"] and isinstance(inc["transcript"], str)
               and isinstance(inc["allowedRootCauses"], list) and inc["allowedRootCauses"]
               and isinstance(b["toolCatalog"], list) and all(isinstance(t, dict) and t.get("name") for t in b["toolCatalog"])
-              and isinstance(pol, dict) and isinstance(pol.get("effectTools"), list) and pol["effectTools"])
+              and isinstance(pol, dict) and isinstance(pol["effectTools"], list))
+        if not isinstance(b.get("publicMarker"), str): b["publicMarker"] = str(b.get("publicMarker") or "")
         if not ok: raise ValueError("shape check failed")
     except (KeyError, ValueError, TypeError, AttributeError) as e:
         log("create rejected:", type(e).__name__, str(e)[:100])
-        raise HttpErr(400)
+        raise HttpErr(400, "%s:%s" % (type(e).__name__, str(e)[:60]))
 
 
 def parse_tp(h):
@@ -522,9 +550,14 @@ class H(BaseHTTPRequestHandler):
         return self.rfile.read(n)
 
     def route(self, method):
+        b = None
         try:
             m = re.fullmatch(r"/v2/incidents(?:/([^/]+)(/receipts)?)?", self.path.split("?")[0].rstrip("/") or "/")
             if method == "GET" and self.path in ("/", "/health"): return self.out(200, {"ok": True})
+            if method == "GET" and self.path == "/debug/errors":
+                return self.out(200, {"llm": {"configured": bool(os.environ.get("LLM_API_KEY")),
+                                              "baseUrl": os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
+                                              "model": os.environ.get("LLM_MODEL", "gpt-4o-mini"), **LLM_STATE}, "recent": RECENT})
             if not m: raise HttpErr(404, "not found")
             if method == "GET":
                 if not m.group(1) or m.group(2): raise HttpErr(404, "not found")
@@ -539,9 +572,11 @@ class H(BaseHTTPRequestHandler):
             if m.group(2): return self.out(200, receipt(m.group(1), b))
             raise HttpErr(404, "not found")
         except HttpErr as e:
+            record(self.path.split("?")[0], e.code, e.msg, b)
             self.out(e.code, {"error": e.msg})
         except Exception as e:
             log("internal error:", type(e).__name__, str(e)[:200])
+            record(self.path.split("?")[0], 500, "%s: %s" % (type(e).__name__, str(e)[:120]), b)
             self.out(500, {"error": "internal"})
 
     def do_GET(self): self.route("GET")
