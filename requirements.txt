@@ -1,0 +1,2 @@
+# incident_agent.py uses only the Python standard library (Python 3.9+).
+# No third-party packages are required.
