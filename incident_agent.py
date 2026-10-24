@@ -161,12 +161,12 @@ Return ONLY JSON: {"rootCause":<exactly one of allowedRootCauses>,"evidence":[2-
 - Never choose an effect unrelated to the evidence."""
 
 
-def call_llm(user, err=None):
+def call_llm(user, err=None, model=None, timeout=12):
     key = os.environ.get("LLM_API_KEY")
     if not key:
         raise RuntimeError("no key")
     base = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+    model = model or os.environ.get("LLM_MODEL", "gpt-4o-mini")
     msgs = [{"role": "system", "content": RULES}, {"role": "user", "content": json.dumps(user)}]
     if err:
         msgs.append({"role": "user", "content": "Previous answer invalid: %s. Return corrected JSON." % err})
@@ -175,7 +175,7 @@ def call_llm(user, err=None):
         req = urllib.request.Request(base + "/chat/completions", json.dumps(payload).encode(),
                                      {"Content-Type": "application/json", "Authorization": "Bearer " + key})
         try:
-            r = json.load(urllib.request.urlopen(req, timeout=20))
+            r = json.load(urllib.request.urlopen(req, timeout=timeout))
         except urllib.error.HTTPError as e:
             if e.code == 400 and "response_format" in payload:
                 payload.pop("response_format")
@@ -219,23 +219,35 @@ def make_plan(body):
             "toolCatalog": body["toolCatalog"],
             "policy": {k: body["policy"].get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}}
     t0, err, plan, name, last = time.time_ns(), None, None, os.environ.get("LLM_MODEL", "gpt-4o-mini"), None
+    base = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
+    fb = os.environ.get("LLM_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite" if "generativelanguage" in base else "")
+    models = list(dict.fromkeys([name] + [m.strip() for m in fb.split(",") if m.strip()]))
     if not os.environ.get("LLM_API_KEY"):
         log("WARNING: LLM_API_KEY not set; using heuristic fallback")
     else:
-        for _ in range(2):
-            try:
-                last = call_llm(user, err)
-                LLM_STATE["lastOk"] = time.strftime("%H:%M:%S")
-                plan = validate_plan(last, body)
+        for m in models:
+            tries = 0
+            while tries < 2 and plan is None and time.time_ns() - t0 < 22e9:
+                tries += 1
+                try:
+                    last = call_llm(user, err, m, timeout=max(4, min(12, 24 - (time.time_ns() - t0) / 1e9)))
+                    LLM_STATE["lastOk"] = time.strftime("%H:%M:%S") + " " + m
+                    name = m
+                    plan = validate_plan(last, body)
+                except Exception as e:  # noqa
+                    err = "%s: %s" % (type(e).__name__, str(e)[:200])
+                    if isinstance(e, urllib.error.HTTPError):
+                        try: err += " " + e.read().decode()[:200]
+                        except Exception: pass
+                        if e.code in (429, 500, 502, 503, 504, 404):
+                            err_model = err
+                            LLM_STATE["lastError"] = "[%s] %s" % (m, err)
+                            log("LLM error (next model):", m, err[:120])
+                            break  # transient/unknown model: move to next model
+                    LLM_STATE["lastError"] = "[%s] %s" % (m, err)
+                    log("LLM/plan error:", m, err[:160])
+            if plan is not None:
                 break
-            except Exception as e:  # noqa
-                err = "%s: %s" % (type(e).__name__, str(e)[:200])
-                if isinstance(e, urllib.error.HTTPError):
-                    try: err += " " + e.read().decode()[:200]
-                    except Exception: pass
-                LLM_STATE["lastError"] = err
-                log("LLM/plan error:", err)
-                if time.time_ns() - t0 > 14e9: break
         if plan is None and last:
             try:
                 plan = validate_plan(last, body, strict=False)
